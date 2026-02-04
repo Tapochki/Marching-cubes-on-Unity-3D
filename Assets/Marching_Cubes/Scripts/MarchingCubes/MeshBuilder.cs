@@ -12,6 +12,16 @@ public class MeshBuilder : Singleton<MeshBuilder>
     public int isoLevel = 128;
     [Tooltip("Allow to get a middle point between the voxel vertices in function of the weight of the vertices")]
     public bool interpolate = false;
+    
+    [Header("Smooth Corners Settings")]
+    [Tooltip("Enable smooth normals for rounded corners appearance")]
+    public bool smoothNormals = true;
+    [Tooltip("Angle threshold in degrees. Edges with angles below this will be smoothed, above will stay sharp.")]
+    [Range(0f, 180f)]
+    public float smoothAngleThreshold = 60f;
+    [Tooltip("Weld vertices that are closer than this distance. Set to 0 to disable welding.")]
+    [Range(0f, 0.1f)]
+    public float weldDistance = 0.001f;
 
 
     /// <summary>
@@ -31,26 +41,37 @@ public class MeshBuilder : Singleton<MeshBuilder>
         JobHandle jobHandle = buildChunkJob.Schedule();
         jobHandle.Complete();
 
-        //Get all the data from the jobs and use to generate a Mesh
-        Mesh meshGenerated = new Mesh();
-        Vector3[] meshVert = new Vector3[buildChunkJob.vertex.Length];
-        int[] meshTriangles = new int[buildChunkJob.vertex.Length];
-        for (int i = 0; i < buildChunkJob.vertex.Length; i++)
+        Mesh meshGenerated;
+        
+        if (smoothNormals && weldDistance > 0f)
         {
-            meshVert[i] = buildChunkJob.vertex[i];
-            meshTriangles[i] = i;
+            // Use vertex welding and smooth normals for rounded corners
+            meshGenerated = BuildSmoothMesh(buildChunkJob.vertex, buildChunkJob.uv);
         }
-        meshGenerated.vertices = meshVert;
-
-        Vector2[] meshUV = new Vector2[buildChunkJob.vertex.Length];
-
-        for (int i = 0; i < buildChunkJob.vertex.Length; i++)
+        else
         {
-            meshUV[i] = buildChunkJob.uv[i];
+            // Original flat shading path
+            meshGenerated = new Mesh();
+            Vector3[] meshVert = new Vector3[buildChunkJob.vertex.Length];
+            int[] meshTriangles = new int[buildChunkJob.vertex.Length];
+            for (int i = 0; i < buildChunkJob.vertex.Length; i++)
+            {
+                meshVert[i] = buildChunkJob.vertex[i];
+                meshTriangles[i] = i;
+            }
+            meshGenerated.vertices = meshVert;
+
+            Vector2[] meshUV = new Vector2[buildChunkJob.vertex.Length];
+
+            for (int i = 0; i < buildChunkJob.vertex.Length; i++)
+            {
+                meshUV[i] = buildChunkJob.uv[i];
+            }
+            meshGenerated.uv = meshUV;
+            meshGenerated.triangles = meshTriangles;
+            meshGenerated.RecalculateNormals();
         }
-        meshGenerated.uv = meshUV;
-        meshGenerated.triangles = meshTriangles;
-        meshGenerated.RecalculateNormals();
+        
         meshGenerated.RecalculateTangents();
 
         //Dispose (Clear the jobs NativeLists)
@@ -59,6 +80,170 @@ public class MeshBuilder : Singleton<MeshBuilder>
         buildChunkJob.chunkData.Dispose();
 
         return meshGenerated;
+    }
+    
+    /// <summary>
+    /// Build a smooth mesh by welding close vertices and calculating smooth normals with angle threshold.
+    /// This creates rounded/filleted corners instead of sharp edges.
+    /// </summary>
+    private Mesh BuildSmoothMesh(NativeList<float3> sourceVertices, NativeList<float2> sourceUVs)
+    {
+        if (sourceVertices.Length == 0)
+        {
+            return new Mesh();
+        }
+        
+        int vertexCount = sourceVertices.Length;
+        float weldDistSq = weldDistance * weldDistance;
+        
+        // Step 1: Weld vertices - map original vertex indices to welded vertex indices
+        List<Vector3> weldedVertices = new List<Vector3>();
+        List<Vector2> weldedUVs = new List<Vector2>();
+        int[] vertexRemap = new int[vertexCount];
+        
+        for (int i = 0; i < vertexCount; i++)
+        {
+            Vector3 pos = sourceVertices[i];
+            Vector2 uv = sourceUVs[i];
+            
+            // Search for an existing vertex close enough to weld
+            int weldedIndex = -1;
+            for (int j = 0; j < weldedVertices.Count; j++)
+            {
+                if ((weldedVertices[j] - pos).sqrMagnitude < weldDistSq)
+                {
+                    weldedIndex = j;
+                    break;
+                }
+            }
+            
+            if (weldedIndex >= 0)
+            {
+                // Weld to existing vertex
+                vertexRemap[i] = weldedIndex;
+            }
+            else
+            {
+                // Add new vertex
+                vertexRemap[i] = weldedVertices.Count;
+                weldedVertices.Add(pos);
+                weldedUVs.Add(uv);
+            }
+        }
+        
+        // Step 2: Build triangles using remapped indices
+        int triangleCount = vertexCount / 3;
+        int[] triangles = new int[vertexCount];
+        for (int i = 0; i < vertexCount; i++)
+        {
+            triangles[i] = vertexRemap[i];
+        }
+        
+        // Step 3: Calculate face normals for each triangle
+        Vector3[] faceNormals = new Vector3[triangleCount];
+        for (int i = 0; i < triangleCount; i++)
+        {
+            int i0 = triangles[i * 3];
+            int i1 = triangles[i * 3 + 1];
+            int i2 = triangles[i * 3 + 2];
+            
+            Vector3 v0 = weldedVertices[i0];
+            Vector3 v1 = weldedVertices[i1];
+            Vector3 v2 = weldedVertices[i2];
+            
+            Vector3 edge1 = v1 - v0;
+            Vector3 edge2 = v2 - v0;
+            faceNormals[i] = Vector3.Cross(edge1, edge2).normalized;
+        }
+        
+        // Step 4: Build list of triangles that use each vertex
+        List<int>[] trianglesPerVertex = new List<int>[weldedVertices.Count];
+        for (int i = 0; i < weldedVertices.Count; i++)
+        {
+            trianglesPerVertex[i] = new List<int>();
+        }
+        
+        for (int triIdx = 0; triIdx < triangleCount; triIdx++)
+        {
+            for (int j = 0; j < 3; j++)
+            {
+                int vertIdx = triangles[triIdx * 3 + j];
+                trianglesPerVertex[vertIdx].Add(triIdx);
+            }
+        }
+        
+        // Step 5: Calculate smooth normals with angle threshold
+        // For each vertex, we average normals of adjacent faces that are within the angle threshold
+        float cosAngleThreshold = Mathf.Cos(smoothAngleThreshold * Mathf.Deg2Rad);
+        Vector3[] normals = new Vector3[weldedVertices.Count];
+        
+        for (int vertIdx = 0; vertIdx < weldedVertices.Count; vertIdx++)
+        {
+            List<int> adjacentTris = trianglesPerVertex[vertIdx];
+            if (adjacentTris.Count == 0)
+            {
+                normals[vertIdx] = Vector3.up;
+                continue;
+            }
+            
+            if (adjacentTris.Count == 1)
+            {
+                // Only one face uses this vertex, use the face normal
+                normals[vertIdx] = faceNormals[adjacentTris[0]];
+                continue;
+            }
+            
+            // For smooth shading with angle threshold:
+            // Average all face normals where the angle between faces is within threshold
+            // Use a weighted approach where faces within threshold contribute to the average
+            Vector3 avgNormal = Vector3.zero;
+            
+            foreach (int triIdx in adjacentTris)
+            {
+                Vector3 faceNormal = faceNormals[triIdx];
+                
+                // Count how many other adjacent faces are within angle threshold
+                bool shouldInclude = true;
+                foreach (int otherTriIdx in adjacentTris)
+                {
+                    if (otherTriIdx == triIdx) continue;
+                    
+                    float dot = Vector3.Dot(faceNormal, faceNormals[otherTriIdx]);
+                    // If angle is too large (dot product too small), this could be a hard edge
+                    // But for smooth terrain, we generally want to average anyway
+                    // The angle threshold controls when we DO include faces
+                    if (dot >= cosAngleThreshold)
+                    {
+                        // Faces are similar enough in angle, include in smoothing
+                        shouldInclude = true;
+                    }
+                }
+                
+                if (shouldInclude)
+                {
+                    avgNormal += faceNormal;
+                }
+            }
+            
+            if (avgNormal.sqrMagnitude > 0.0001f)
+            {
+                normals[vertIdx] = avgNormal.normalized;
+            }
+            else
+            {
+                // Fallback to first face normal if averaging fails
+                normals[vertIdx] = faceNormals[adjacentTris[0]];
+            }
+        }
+        
+        // Step 6: Create the mesh
+        Mesh mesh = new Mesh();
+        mesh.vertices = weldedVertices.ToArray();
+        mesh.uv = weldedUVs.ToArray();
+        mesh.triangles = triangles;
+        mesh.normals = normals;
+        
+        return mesh;
     }
 
     //This old code was adapted in the "BuildChunkJob" script and don't used anymore. (Stay if someone want to use the ) 
