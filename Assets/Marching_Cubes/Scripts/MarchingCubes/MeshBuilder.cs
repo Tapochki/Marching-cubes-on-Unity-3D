@@ -43,6 +43,8 @@ public class MeshBuilder : Singleton<MeshBuilder>
 
         Mesh meshGenerated;
         
+        // Note: Smooth normals require vertex welding because without shared vertices,
+        // each triangle has its own unique vertices and normal averaging is meaningless.
         if (smoothNormals && weldDistance > 0f)
         {
             // Use vertex welding and smooth normals for rounded corners
@@ -97,6 +99,9 @@ public class MeshBuilder : Singleton<MeshBuilder>
         float weldDistSq = weldDistance * weldDistance;
         
         // Step 1: Weld vertices - map original vertex indices to welded vertex indices
+        // Note: This is O(n*m) where n is input vertices and m is unique vertices.
+        // For typical Marching Cubes chunks (< 10k vertices), this is acceptable.
+        // For larger meshes, consider using a spatial hash map for O(n) complexity.
         List<Vector3> weldedVertices = new List<Vector3>();
         List<Vector2> weldedUVs = new List<Vector2>();
         int[] vertexRemap = new int[vertexCount];
@@ -194,32 +199,23 @@ public class MeshBuilder : Singleton<MeshBuilder>
             }
             
             // For smooth shading with angle threshold:
-            // Average all face normals where the angle between faces is within threshold
-            // Use a weighted approach where faces within threshold contribute to the average
+            // Use the first face as reference and average with other faces 
+            // only if the angle between them is within threshold.
+            // This creates smooth shading on gentle surfaces while preserving
+            // harder edges where faces meet at steep angles.
             Vector3 avgNormal = Vector3.zero;
+            Vector3 referenceNormal = faceNormals[adjacentTris[0]];
             
             foreach (int triIdx in adjacentTris)
             {
                 Vector3 faceNormal = faceNormals[triIdx];
                 
-                // Count how many other adjacent faces are within angle threshold
-                bool shouldInclude = true;
-                foreach (int otherTriIdx in adjacentTris)
-                {
-                    if (otherTriIdx == triIdx) continue;
-                    
-                    float dot = Vector3.Dot(faceNormal, faceNormals[otherTriIdx]);
-                    // If angle is too large (dot product too small), this could be a hard edge
-                    // But for smooth terrain, we generally want to average anyway
-                    // The angle threshold controls when we DO include faces
-                    if (dot >= cosAngleThreshold)
-                    {
-                        // Faces are similar enough in angle, include in smoothing
-                        shouldInclude = true;
-                    }
-                }
+                // Check if this face's normal is within angle threshold of reference
+                float dot = Vector3.Dot(faceNormal, referenceNormal);
                 
-                if (shouldInclude)
+                // If dot >= cosAngleThreshold, the angle between normals is small enough
+                // to be considered part of the same smooth surface
+                if (dot >= cosAngleThreshold)
                 {
                     avgNormal += faceNormal;
                 }
@@ -231,8 +227,8 @@ public class MeshBuilder : Singleton<MeshBuilder>
             }
             else
             {
-                // Fallback to first face normal if averaging fails
-                normals[vertIdx] = faceNormals[adjacentTris[0]];
+                // Fallback to reference face normal if averaging fails
+                normals[vertIdx] = referenceNormal;
             }
         }
         
